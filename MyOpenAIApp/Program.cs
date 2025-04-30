@@ -122,41 +122,35 @@ public class Program
         // --- Orchestration Logic ---
         Console.WriteLine($"Starting analysis for Form ID: {sampleInput.FormId}");
         var detailedFindings = new List<object>();
+        var imageAnalysisTasks = new List<Task<(Finding finding, string analysisResult)>>(); // Store tasks and findings
 
         foreach (var finding in sampleInput.Findings)
         {
-            string imageDescription = "N/A";
             if (!string.IsNullOrWhiteSpace(finding.ImageUrl))
             {
-                Console.WriteLine($"Analyzing image for: {finding.Description}");
-                try
-                {
-                    // Direct invocation via Plugins collection using string literal for function name
-                    var functionToInvoke = kernel.Plugins["ImageAnalysis"]["DescribeImageAsync"];
-
-                    // Create arguments, including the deployment name for the function parameter
-                    var arguments = new KernelArguments()
-                    {
-                        { "imageUrl", finding.ImageUrl },
-                        { "visionDeploymentName", deploymentName } // Pass deployment name here
-                    };
-
-                    var imageResult = await functionToInvoke.InvokeAsync(kernel, arguments);
-
-                    imageDescription = imageResult.GetValue<string>() ?? "Analysis failed or returned null.";
-                    Console.WriteLine($" -> Image Analysis Result: {imageDescription.Substring(0, Math.Min(imageDescription.Length, 100))}...");
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($" -> Error analyzing image {finding.ImageUrl}: {ex.Message}");
-                    // Log the full exception for debugging
-                    Console.WriteLine(ex.ToString());
-                    imageDescription = $"Error analyzing image: {ex.GetType().Name}";
-                }
+                // Launch the analysis task but don't await it here
+                imageAnalysisTasks.Add(AnalyzeImageAsync(kernel, finding, deploymentName));
             }
-            // Include the original ImageUrl in the detailed findings object
-            detailedFindings.Add(new { finding.Description, finding.ImageUrl, ImageAnalysis = imageDescription });
+            else
+            {
+                // For findings without images, add them directly or handle later
+                // Option: Add directly with "N/A" analysis
+                detailedFindings.Add(new { finding.Description, finding.ImageUrl, ImageAnalysis = "N/A" });
+            }
         }
+
+        // Wait for all image analysis tasks to complete concurrently
+        var analysisResults = await Task.WhenAll(imageAnalysisTasks);
+
+        // Process the results of the completed tasks
+        foreach (var result in analysisResults)
+        {
+            detailedFindings.Add(new { result.finding.Description, result.finding.ImageUrl, ImageAnalysis = result.analysisResult });
+        }
+
+        // Sort detailedFindings to maintain original order if necessary (optional)
+        // detailedFindings = detailedFindings.OrderBy(f => sampleInput.Findings.IndexOf( /* logic to find original finding */ )).ToList();
+
 
         var findingsJson = JsonSerializer.Serialize(detailedFindings, new JsonSerializerOptions { WriteIndented = true });
         var kernelArguments = new KernelArguments
@@ -221,5 +215,33 @@ public class Program
         }
 
         Console.WriteLine("\nExecution finished.");
+    } // End Main
+
+    // Helper function to encapsulate image analysis logic for parallel execution
+    private static async Task<(Finding finding, string analysisResult)> AnalyzeImageAsync(Kernel kernel, Finding finding, string deploymentName)
+    {
+        Console.WriteLine($"Analyzing image for: {finding.Description}");
+        string imageDescription;
+        try
+        {
+            var functionToInvoke = kernel.Plugins["ImageAnalysis"]["DescribeImageAsync"];
+            var arguments = new KernelArguments()
+            {
+                { "imageUrl", finding.ImageUrl },
+                { "visionDeploymentName", deploymentName }
+            };
+
+            var imageResult = await functionToInvoke.InvokeAsync(kernel, arguments);
+            imageDescription = imageResult.GetValue<string>() ?? "Analysis failed or returned null.";
+            Console.WriteLine($" -> Image Analysis Result for '{finding.Description}': {imageDescription.Substring(0, Math.Min(imageDescription.Length, 100))}...");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($" -> Error analyzing image {finding.ImageUrl}: {ex.Message}");
+            // Consider logging the full exception ex.ToString()
+            imageDescription = $"Error analyzing image: {ex.GetType().Name}";
+        }
+        return (finding, imageDescription);
     }
-}
+
+} // End Program
