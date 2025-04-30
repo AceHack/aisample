@@ -1,207 +1,225 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.IO; // Added for Path.GetExtension and MemoryStream
-using System.Linq; // Added for LINQ methods
-using System.Net.Http;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
 using System.Threading.Tasks;
 using Azure;
 using Azure.AI.OpenAI;
-using Azure.Core;
-using OpenAI.Chat; // Added this using directive
-using MimeDetective; // Use the correct namespace for Mime-Detective
+using Microsoft.Extensions.DependencyInjection; // Keep for AddAzureOpenAIChatCompletion
+using Microsoft.SemanticKernel;
+using Microsoft.SemanticKernel.Connectors.OpenAI;
+using MyOpenAIApp.Plugins;
 
-// Declare a static HttpClient instance accessible to local functions
-// This avoids socket exhaustion issues by reusing the same client.
-HttpClient sharedHttpClient = new(); // Use a local variable accessible by local functions
-
-// Helper function to determine media type from URL (now a static local function)
-static string GetMediaTypeFromUrl(string url)
+// Main entry point needs to be async
+public class Program
 {
-    try
+    public static async Task Main(string[] args)
     {
-        var uri = new Uri(url);
-        string? formatParam = null; // Use nullable reference type
+        // Read configuration from environment variables
+        var apiKey = Environment.GetEnvironmentVariable("AZURE_OPENAI_API_KEY");
+        var endpointString = Environment.GetEnvironmentVariable("AZURE_OPENAI_ENDPOINT");
+        var deploymentName = Environment.GetEnvironmentVariable("AZURE_OPENAI_DEPLOYMENT_NAME"); // Used for both text and vision
 
-        // Manually parse the query string
-        if (!string.IsNullOrEmpty(uri.Query))
+        // --- Environment Variable Validation --- (Adjusted)
+        if (string.IsNullOrEmpty(apiKey)) { Console.WriteLine("Error: AZURE_OPENAI_API_KEY environment variable not set."); return; }
+        if (string.IsNullOrEmpty(endpointString)) { Console.WriteLine("Error: AZURE_OPENAI_ENDPOINT environment variable not set."); return; }
+        if (string.IsNullOrEmpty(deploymentName)) { Console.WriteLine("Error: AZURE_OPENAI_DEPLOYMENT_NAME environment variable not set."); return; }
+        if (!Uri.TryCreate(endpointString, UriKind.Absolute, out var endpoint)) { Console.WriteLine($"Error: Invalid URI format for AZURE_OPENAI_ENDPOINT: {endpointString}"); return; }
+
+
+        // --- Semantic Kernel Setup ---
+        var kernelBuilder = Kernel.CreateBuilder();
+
+        // Configure services - only add the chat completion service here
+        kernelBuilder.Services.AddAzureOpenAIChatCompletion(
+            deploymentName, // Text model deployment
+            endpointString,
+            apiKey);
+
+        // Build the Kernel
+        var kernel = kernelBuilder.Build();
+
+        // --- Setup for Image Analysis Plugin (Manual Instantiation) ---
+        // Create the OpenAIClient needed by the plugin manually
+        var visionClient = new OpenAIClient(endpoint, new AzureKeyCredential(apiKey));
+
+        // Instantiate the plugin manually, passing only the client
+        var imagePlugin = new ImageAnalysisPlugin(visionClient);
+
+        // Import the manually created plugin instance into the kernel using a simple name
+        kernel.ImportPluginFromObject(imagePlugin, "ImageAnalysis"); // Use "ImageAnalysis" as the plugin name
+        // --- End Plugin Setup ---
+
+        // --- Define the Analysis Prompt (Semantic Function) ---
+        // Incorporate persona from agents.yaml
+        var persona = """
+        You are an expert Business Opportunity Analyst skilled at interpreting visual information and connecting it
+        to market trends and business potential. You use an advanced image analysis tool
+        to understand the content and context of images provided. Your goal is to analyze images and associated text
+        to identify potential business opportunities, trends, or insights.
+        """;
+
+        var analysisTask = """
+        Analyze the following findings from a form (Form ID: {{$formId}}) to identify potential business opportunities or consulting services.
+        Consider the descriptions and any associated image analysis provided. Focus on emerging trends or complex areas revealed by the analyses.
+
+        Findings:
+        {{$findingsJson}}
+
+        Based *only* on the information provided in the findings, generate a report outlining potential business opportunities.
+        Crucially, you MUST generate at least one distinct opportunity derived from the analysis of EACH finding provided. Ensure that the final list reflects insights from all analyzed findings.
+
+        For each opportunity, provide:
+        1. A title.
+        2. A brief description.
+        3. Its potential impact (High/Medium/Low).
+        4. The 'SourceDescription' from the specific finding that primarily inspired the opportunity.
+        5. The 'SourceImageUrl' from the specific finding (if one was provided for that finding).
+
+        Format the output as a JSON object matching the following structure:
         {
-            // Remove the leading '?'
-            string query = uri.Query.Substring(1);
-            var parts = query.Split('&');
-            foreach (var part in parts)
+          "IdentifiedOpportunities": [
             {
-                var keyValue = part.Split('=');
-                if (keyValue.Length == 2 && keyValue[0].Equals("format", StringComparison.OrdinalIgnoreCase))
+              "Title": "Opportunity Title",
+              "Description": "Detailed description of the opportunity based on findings.",
+              "PotentialImpact": "High/Medium/Low impact assessment.",
+              "SourceDescription": "The original description text from the finding.",
+              "SourceImageUrl": "The URL of the image from the finding, or null if none."
+            }
+            // ... more opportunities
+          ]
+        }
+
+        Ensure the output is valid JSON. If no opportunities are identified, return an empty list: { "IdentifiedOpportunities": [] }
+        """;
+
+        // Combine persona and task for the final prompt
+        var analysisPrompt = $"{persona}\n\n{analysisTask}";
+
+
+        // Create the Semantic Function from the prompt
+#pragma warning disable SKEXP0010 // Disable warning for experimental ResponseFormat
+        var analysisFunction = kernel.CreateFunctionFromPrompt(
+            analysisPrompt,
+            executionSettings: new OpenAIPromptExecutionSettings { ResponseFormat = "json_object" } // Request JSON output
+        );
+#pragma warning restore SKEXP0010 // Restore warning
+
+
+        // --- Prepare Input Data ---
+        var sampleInput = new StructuredImageAnalysisInput(
+            FormId: "FORM_CSHARP_SEMANTIC_KERNEL_TEST",
+            Findings: new List<Finding>
+            {
+                new Finding("Finding 1: Overview diagram.", "https://miro.medium.com/v2/resize:fit:4800/format:webp/1*vdvf-ds54uMEZQO7ZpY9iA.png"),
+                new Finding("Finding 2: Cloud architecture.", "https://www.networkbachelor.com/wp-content/uploads/2021/01/Azure.png"),
+                new Finding("Finding 3: Text-only observation about market trends.") // No image
+            }
+        );
+
+
+        // --- Orchestration Logic ---
+        Console.WriteLine($"Starting analysis for Form ID: {sampleInput.FormId}");
+        var detailedFindings = new List<object>();
+
+        foreach (var finding in sampleInput.Findings)
+        {
+            string imageDescription = "N/A";
+            if (!string.IsNullOrWhiteSpace(finding.ImageUrl))
+            {
+                Console.WriteLine($"Analyzing image for: {finding.Description}");
+                try
                 {
-                    formatParam = keyValue[1];
-                    break; // Found the format parameter
+                    // Direct invocation via Plugins collection using string literal for function name
+                    var functionToInvoke = kernel.Plugins["ImageAnalysis"]["DescribeImageAsync"];
+
+                    // Create arguments, including the deployment name for the function parameter
+                    var arguments = new KernelArguments()
+                    {
+                        { "imageUrl", finding.ImageUrl },
+                        { "visionDeploymentName", deploymentName } // Pass deployment name here
+                    };
+
+                    var imageResult = await functionToInvoke.InvokeAsync(kernel, arguments);
+
+                    imageDescription = imageResult.GetValue<string>() ?? "Analysis failed or returned null.";
+                    Console.WriteLine($" -> Image Analysis Result: {imageDescription.Substring(0, Math.Min(imageDescription.Length, 100))}...");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($" -> Error analyzing image {finding.ImageUrl}: {ex.Message}");
+                    // Log the full exception for debugging
+                    Console.WriteLine(ex.ToString());
+                    imageDescription = $"Error analyzing image: {ex.GetType().Name}";
                 }
             }
+            // Include the original ImageUrl in the detailed findings object
+            detailedFindings.Add(new { finding.Description, finding.ImageUrl, ImageAnalysis = imageDescription });
         }
 
-        // Check query parameters first (like format=webp)
-        if (!string.IsNullOrEmpty(formatParam))
+        var findingsJson = JsonSerializer.Serialize(detailedFindings, new JsonSerializerOptions { WriteIndented = true });
+        var kernelArguments = new KernelArguments
         {
-            return $"image/{formatParam.ToLowerInvariant()}"; // Use ToLowerInvariant
-        }
+            { "formId", sampleInput.FormId },
+            { "findingsJson", findingsJson }
+        };
 
-        // Fallback to file extension
-        string extension = Path.GetExtension(uri.AbsolutePath).ToLowerInvariant();
-        switch (extension)
+        Console.WriteLine("\nInvoking main analysis function...");
+        try
         {
-            case ".png": return "image/png";
-            case ".jpg":
-            case ".jpeg": return "image/jpeg";
-            case ".gif": return "image/gif";
-            case ".webp": return "image/webp";
-            // Add more cases as needed
-            default: return "application/octet-stream"; // Default or throw an error
-        }
-    }
-    catch (UriFormatException)
-    {
-        // Handle invalid URL format if necessary
-        Console.WriteLine($"Warning: Could not parse URI: {url}");
-        return "application/octet-stream";
-    }
-}
+            var analysisResult = await kernel.InvokeAsync(analysisFunction, kernelArguments);
+            var resultJson = analysisResult.GetValue<string>();
 
+            Console.WriteLine("\n--- Analysis Result (Raw JSON) ---");
+            Console.WriteLine(resultJson);
 
-// Read configuration from environment variables
-var apiKey = Environment.GetEnvironmentVariable("AZURE_OPENAI_API_KEY");
-var endpointString = Environment.GetEnvironmentVariable("AZURE_OPENAI_ENDPOINT");
-var deploymentName = Environment.GetEnvironmentVariable("AZURE_OPENAI_DEPLOYMENT_NAME");
-var apiVersionString = Environment.GetEnvironmentVariable("AZURE_OPENAI_API_VERSION"); // Read API Version
-
-if (string.IsNullOrEmpty(apiKey))
-{
-    Console.WriteLine("Error: AZURE_OPENAI_API_KEY environment variable not set.");
-    return; // Exit if the key is not found
-}
-if (string.IsNullOrEmpty(endpointString))
-{
-    Console.WriteLine("Error: AZURE_OPENAI_ENDPOINT environment variable not set.");
-    return; // Exit if the endpoint is not found
-}
-if (string.IsNullOrEmpty(deploymentName))
-{
-    Console.WriteLine("Error: AZURE_OPENAI_DEPLOYMENT_NAME environment variable not set.");
-    return; // Exit if the deployment name is not found
-}
-// Note: AZURE_OPENAI_MODEL_NAME is typically implicitly handled by the deployment name in Azure.
-
-if (!Uri.TryCreate(endpointString, UriKind.Absolute, out var endpoint))
-{
-    Console.WriteLine($"Error: Invalid URI format for AZURE_OPENAI_ENDPOINT: {endpointString}");
-    return; // Exit if the URI is invalid
-}
-
-// Configure client options
-// Note: Explicitly setting the API version via AzureOpenAIClientOptions.Version
-// is not supported in Azure.AI.OpenAI v2.1.0. The SDK typically uses a
-// default version or determines it based on the endpoint.
-var clientOptions = new AzureOpenAIClientOptions();
-
-// Use the configuration from environment variables
-AzureOpenAIClient azureClient = new(
-    endpoint,
-    new AzureKeyCredential(apiKey),
-    clientOptions); // Pass the configured options
-ChatClient chatClient = azureClient.GetChatClient(deploymentName);
-
-// Define the image URL (could also be moved to config)
-string imageUrl = "https://miro.medium.com/v2/resize:fit:4800/format:webp/1*vdvf-ds54uMEZQO7ZpY9iA.png";
-
-// Prepare message content parts asynchronously using the shared HttpClient
-async Task<List<ChatMessageContentPart>> CreateContentPartsAsync(string urlForImage)
-{
-    byte[] imageBytes;
-
-    // Download the image using the shared HttpClient instance
-    try
-    {
-        imageBytes = await sharedHttpClient.GetByteArrayAsync(urlForImage);
-    }
-    catch (HttpRequestException e)
-    {
-        Console.WriteLine($"Error downloading image: {e.Message}");
-        return new List<ChatMessageContentPart> { ChatMessageContentPart.CreateTextPart("Please describe the image (failed to load)") };
-    }
-
-    // Detect MIME type from content using Mime-Detective
-    string detectedMimeType = "application/octet-stream"; // Default fallback
-    try
-    {
-        // Mime-Detective works with streams, so wrap the byte array
-        using (var memoryStream = new MemoryStream(imageBytes))
-        {
-            var inspector = new ContentInspectorBuilder()
+            if (!string.IsNullOrWhiteSpace(resultJson))
             {
-                Definitions = MimeDetective.Definitions.DefaultDefinitions.All()
-            }.Build();
-            var mimeTypeResult = inspector.Inspect(memoryStream).ByMimeType().Single();
-            if (mimeTypeResult != null && !string.IsNullOrEmpty(mimeTypeResult.MimeType))
-            {
-                detectedMimeType = mimeTypeResult.MimeType;
-                Console.WriteLine($"[Mime-Detective] Detected MIME type: {detectedMimeType}");
+                try
+                {
+                    var jsonOptions = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+                    var report = JsonSerializer.Deserialize<OpportunitiesReport>(resultJson, jsonOptions);
+
+                    if (report != null && report.IdentifiedOpportunities != null && report.IdentifiedOpportunities.Any())
+                    {
+                        Console.WriteLine("\n--- Identified Opportunities ---");
+                        foreach (var opp in report.IdentifiedOpportunities)
+                        {
+                            Console.WriteLine($"  Title: {opp.Title}");
+                            Console.WriteLine($"  Description: {opp.Description}");
+                            Console.WriteLine($"  Impact: {opp.PotentialImpact}");
+                            Console.WriteLine($"  Source Finding: {opp.SourceDescription}"); // Display source
+                            if (!string.IsNullOrEmpty(opp.SourceImageUrl))
+                            {
+                                Console.WriteLine($"  Source Image: {opp.SourceImageUrl}"); // Display source image if present
+                            }
+                            Console.WriteLine(); // Add blank line
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine("\nNo business opportunities identified in the report.");
+                    }
+                }
+                catch (JsonException jsonEx)
+                {
+                    Console.WriteLine($"\nError deserializing analysis result: {jsonEx.Message}");
+                    Console.WriteLine("Please check the raw JSON output above for potential formatting issues.");
+                }
             }
             else
             {
-                Console.WriteLine("[Mime-Detective] Could not detect MIME type from content. Falling back to URL-based detection.");
-                detectedMimeType = GetMediaTypeFromUrl(urlForImage);
-                Console.WriteLine($"[URL Fallback] Detected MIME type: {detectedMimeType}");
+                Console.WriteLine("\nAnalysis function returned empty or null result.");
             }
         }
-    }
-    catch (Exception ex) // Catch potential errors during detection
-    {
-        Console.WriteLine($"[Mime-Detective] Error during detection: {ex.Message}. Falling back to URL-based detection.");
-        detectedMimeType = GetMediaTypeFromUrl(urlForImage);
-        Console.WriteLine($"[URL Fallback] Detected MIME type: {detectedMimeType}");
-    }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"\nAn error occurred during kernel invocation: {ex.Message}");
+            // Log the full exception for debugging
+            Console.WriteLine(ex.ToString());
+        }
 
-    // Return list with text and the successfully loaded image part
-    return new List<ChatMessageContentPart>
-    {
-        ChatMessageContentPart.CreateTextPart("Please describe the image"),
-        ChatMessageContentPart.CreateImagePart(BinaryData.FromBytes(imageBytes), detectedMimeType, ChatImageDetailLevel.Auto)
-    };
-}
-
-
-List<ChatMessage> messages = new List<ChatMessage>()
-{
-    new SystemChatMessage("You are a helpful assistant."),
-    // Create UserChatMessage content asynchronously
-    // Note: This requires adjusting how messages are constructed or passed to the client
-    // For simplicity here, we'll await the creation before initializing the list.
-    // A more complex scenario might involve building the message list differently.
-};
-
-// Await the async content creation before adding the UserChatMessage
-// Pass the specific imageUrl to the helper function
-var userMessageContentParts = await CreateContentPartsAsync(imageUrl);
-messages.Add(new UserChatMessage(userMessageContentParts));
-
-
-try
-{
-    // Call CompleteChatAsync since we are in an async context
-    var response = await chatClient.CompleteChatAsync(messages);
-    // Accessing the content correctly based on typical Azure SDK patterns
-    if (response.Value.Content.Count > 0 && response.Value.Content[0].Kind == ChatMessageContentPartKind.Text)
-    {
-        Console.WriteLine(response.Value.Content[0].Text);
-    }
-    else
-    {
-        Console.WriteLine("No text response content received.");
+        Console.WriteLine("\nExecution finished.");
     }
 }
-catch (Exception ex)
-{
-    Console.WriteLine($"An error occurred: {ex.Message}");
-}
-
-// Ensure the HttpClient is disposed when the application exits (optional for console apps, but good practice)
-sharedHttpClient.Dispose();
